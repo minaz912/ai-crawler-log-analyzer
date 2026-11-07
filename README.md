@@ -1,15 +1,15 @@
 # aicrawl: AI crawler log analyzer
 
-Answer-engine tools look at what AI models *say*. This one looks at what they *read*. Give it a site's access logs and it tells you:
+aicrawl reads a website's access logs and reports which AI bots fetched the site, which pages they read and how often, whether each bot is who it claims to be, and whether robots.txt allowed the visit. It is a Python CLI on DuckDB, and `duckdb` is its only dependency.
 
-- **which AI bots crawl the site** (GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-SearchBot, Claude-User, PerplexityBot, Perplexity-User, Bytespider, CCBot, Meta, Amazonbot, Applebot, DuckAssistBot, Mistral…), with Googlebot and Bingbot as a baseline
-- **whether they're genuine**, checked against each vendor's published IP ranges or forward-confirmed reverse DNS
-- **what kind of fetch it is**: training crawler, AI search indexer, or live user-triggered fetch
-- **which pages they fetch and how often**, as a daily series
-- **whether they're allowed to**, using an RFC 9309 robots.txt evaluator and linter: pages blocked by mistake, rules that do nothing, and bots ignoring robots.txt
-- **coverage gaps**: pages people visit (or that are in your sitemap / llms.txt) that no AI bot has fetched
+For each run it reports:
 
-It's a Python CLI on DuckDB. Its only dependency is `duckdb`.
+- Which AI bots crawl the site: GPTBot, OAI-SearchBot, ChatGPT-User, ClaudeBot, Claude-SearchBot, Claude-User, PerplexityBot, Perplexity-User, Bytespider, CCBot, Meta, Amazonbot, Applebot, DuckAssistBot, Mistral and others. Googlebot and Bingbot are included as a baseline.
+- Whether each request is genuine, checked against the vendor's published IP ranges or forward-confirmed reverse DNS.
+- What kind of fetch it is. Training crawlers collect data for future models, AI search indexers build the index behind AI answers, and user-triggered fetches happen when someone asks an assistant about a page.
+- Which pages each bot fetches and how often, per day.
+- Whether robots.txt allows the fetch. An RFC 9309 evaluator decides each request, and a linter finds rules that block pages by mistake, rules that block nothing, and bots that ignore robots.txt.
+- Coverage gaps: pages that people visit, or that appear in your sitemap or llms.txt, which no AI bot has fetched.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ aicrawl report --site https://www.example.com --html report.html
 aicrawl report --robots robots.txt --sitemap sitemap.xml --llms llms.txt --since 2026-10-01
 ```
 
-Data lives in `aicrawl.duckdb` (change it with `--db`). Ingesting the same file again replaces its rows.
+Data goes into `aicrawl.duckdb`, or the file you pass with `--db`. Ingesting a file a second time replaces its earlier rows.
 
 ### Commands
 
@@ -38,18 +38,24 @@ Data lives in `aicrawl.duckdb` (change it with `--db`). Ingesting the same file 
 | `ranges` | Download the published IP lists (OpenAI ×3, Anthropic, Perplexity ×2, Google, Bing, Apple, Common Crawl, DuckDuckGo, Mistral) |
 | `ingest FILE…` | Parse logs into DuckDB, classify user agents, verify IPs. `--format`, `--host`, `--append`, `--rdns` |
 | `verify [--rdns]` | Re-run verification (after `ranges`, or to add reverse-DNS checks) |
-| `report` | Terminal report. `--html` adds a self-contained chart page. `--site` fetches robots.txt / llms.txt / sitemap |
-| `robots FILE PATH…` | Show which rule decides each path for each bot: handy for testing edge cases |
+| `report` | Terminal report. `--html` adds a self-contained chart page. `--site` fetches robots.txt, llms.txt and the sitemap |
+| `robots FILE PATH…` | Show which rule decides each path for each bot, for testing edge cases |
 | `sample DIR` | Generate sample logs (`--format combined/cloudflare/cloudfront`, `--days`, `--scale`) |
 | `demo` | `ranges` + `sample` + `ingest` + `report` |
 
 ## How it works
 
-**Ingestion** (`ingest.py`). Everything is parsed inside DuckDB. Combined-format lines are read as single-column CSV and split with one `regexp_extract`. Cloudflare uses `read_json`, and CloudFront uses `read_csv` mapped through its `#Fields:` header. Gzip is handled transparently. About 2.2M lines (469 MB) load in roughly 2.5s on a laptop. Timestamps are stored as UTC.
+### Ingestion
 
-**Classification** (`bots.py`). User agents are classified once per *distinct* UA in Python (thousands, not millions), then joined back. The `hits` view in `db.py` puts it all together.
+`ingest.py` does all parsing inside DuckDB. It reads combined-format lines as single-column CSV and splits them with one `regexp_extract`. Cloudflare logs go through `read_json`, and CloudFront logs through `read_csv`, with columns mapped from the `#Fields:` header. DuckDB decompresses gzip on its own. On a laptop, 2.2M lines (469 MB) load in about 2.5 seconds. Timestamps are stored in UTC.
 
-**Verification** (`verify.py`). Vendor IP lists are merged into sorted integer intervals for binary-search lookup. Reverse DNS has to be *forward-confirmed* (PTR → hostname → A/AAAA back to the same IP), otherwise anyone who controls their PTR record could claim to be `googlebot.com`. Verdicts:
+### Classification
+
+`bots.py` classifies each distinct user agent once in Python. A log has thousands of distinct user agents and millions of lines, so this is cheap. The results are joined back to the requests in the `hits` view in `db.py`.
+
+### Verification
+
+`verify.py` merges each vendor's IP list into sorted integer intervals and looks addresses up with binary search. A reverse-DNS match only counts when it is forward-confirmed (PTR to hostname, then A/AAAA back to the same IP). Without that check, anyone who controls their own PTR record could claim to be `googlebot.com`. Each IP and bot pair gets one verdict:
 
 | verdict | meaning |
 |---|---|
@@ -58,31 +64,37 @@ Data lives in `aicrawl.duckdb` (change it with `--db`). Ingesting the same file 
 | `unverifiable` | the vendor publishes nothing (Bytespider, Meta, Cohere…) |
 | `unchecked` | a method exists but wasn't run (`aicrawl ranges` / `--rdns`) |
 
-Spoofed requests are excluded from volume, page and coverage numbers and reported separately. In the sample data, every "GPTBot" request that ignores robots.txt comes from a scraper, not OpenAI.
+The report lists spoofed requests separately and leaves them out of the volume, page and coverage numbers. In the sample data, every "GPTBot" request that ignores robots.txt comes from a scraper rather than OpenAI.
 
-**robots.txt** (`robots.py`). Python's `urllib.robotparser` gets several things wrong (first match instead of longest match, no `*`/`$`, no group merging), so this is a separate implementation. Edge cases it handles and tests:
+### robots.txt
 
-- A bot that has its own group ignores the `*` group entirely. The linter warns when that silently lets it into `/admin`, `/cart` and so on.
-- Several `User-agent` lines can share one group. Repeated groups for the same bot merge. Blank lines don't end a group.
-- Longest match wins and Allow wins ties. `*` and `$` wildcards. Percent-encoding normalisation (`/café` = `/caf%C3%A9`).
-- Paths are case-sensitive: `Disallow: /Docs/` doesn't block `/docs/`. The linter catches this from real URLs.
-- Prefix overreach: `Disallow: /admin` also blocks `/administration-guide`.
-- Misspelled directives (`Disalow`) are honoured only for Googlebot, which documents that tolerance. They're reported as errors, along with which pages slipped through.
-- An empty `Disallow:` allows everything. `/robots.txt` is always fetchable. BOM, CRLF, rules before any `User-agent` line, and the 500 KiB limit.
-- `Content-Usage: train-ai=n` (IETF aipref draft) is collected per group. Anthropic now honours it for ClaudeBot when ClaudeBot isn't named explicitly.
-- Control-only tokens (`Google-Extended`, `Applebot-Extended`) are shown in the policy table.
+Python's `urllib.robotparser` uses the first matching rule instead of the longest, ignores `*` and `$`, and doesn't merge groups, so `robots.py` has its own implementation. It handles and tests these cases:
 
-**"Blocked by mistake"** is a heuristic: popular pages (by human traffic) that Googlebot may crawl but an AI search indexer or assistant may not. Pages blocked for everyone (cart, search) are treated as deliberate.
+- A bot with its own group ignores the `*` group entirely. The linter warns when that lets the bot into `/admin`, `/cart` and similar paths.
+- Several `User-agent` lines can share one group, repeated groups for the same bot merge, and blank lines don't end a group.
+- The longest match wins and Allow wins ties. It supports `*` and `$` wildcards and percent-encoding normalisation (`/café` = `/caf%C3%A9`).
+- Paths are case-sensitive, so `Disallow: /Docs/` doesn't block `/docs/`. The linter finds these by comparing rules with real URLs from the logs.
+- `Disallow: /admin` is a prefix match and also blocks `/administration-guide`.
+- Googlebot documents that it accepts misspelled directives such as `Disalow`, so only Googlebot gets that tolerance. The linter reports the typo as an error and lists the pages other bots fetched because of it.
+- An empty `Disallow:` allows everything, and `/robots.txt` is always fetchable. It also handles a BOM, CRLF line endings, rules before any `User-agent` line, and the 500 KiB size limit.
+- `Content-Usage: train-ai=n` lines (IETF aipref draft) are collected per group. Anthropic honours this signal for ClaudeBot when robots.txt doesn't name ClaudeBot.
+- The policy table includes `Google-Extended` and `Applebot-Extended`, which only appear in robots.txt and are never sent as user agents.
 
-**Coverage gaps**: the page universe is human-visited pages plus sitemap URLs. A gap is a page that robots.txt allows for some active training or search bot but no genuine bot of that type fetched. User-triggered fetchers are left out because they only fetch what people ask about.
+The "blocked by mistake" check flags popular pages (by human traffic) that Googlebot may crawl but an AI search indexer or assistant may not. Pages blocked for every bot, such as the cart, count as deliberate.
 
-**llms.txt**: parsed per llmstxt.org (H1 title, `>` summary, `##` link sections). The report shows who fetched it and which linked pages no AI bot has read.
+### Coverage gaps
+
+The set of known pages is every page people visited plus every sitemap URL. A page is a gap when robots.txt allows it for an active training or search bot and no genuine bot of that type fetched it. User-triggered fetchers only load pages people ask about, so they aren't counted.
+
+### llms.txt
+
+aicrawl parses llms.txt according to llmstxt.org: an H1 title, a `>` summary, and `##` sections of links. The report shows which bots fetched the file and which linked pages no AI bot has read.
 
 ## Caveats
 
-- Bot categories reflect each vendor's own description. Vendors say user-triggered fetchers act for a person and may not follow robots.txt the way crawlers do, so the report labels those requests rather than calling them violations.
-- Amazonbot and CCBot support reverse DNS. That's opt-in (`--rdns`) because it does network lookups.
-- `sample` takes bot IPs from the real vendor ranges if `aicrawl ranges` has run. Offline, it falls back to synthetic ranges in `198.18.0.0/15` and the report warns about it. Run `aicrawl ranges` before analysing real logs in the same database, so the real lists replace the synthetic ones.
+- Bot categories follow each vendor's own description. Vendors say user-triggered fetchers act for a person and may not follow robots.txt as crawlers do, so the report labels those requests instead of calling them violations.
+- Amazonbot and CCBot can be checked with reverse DNS. That check is opt-in (`--rdns`) because it makes network lookups.
+- `sample` takes bot IPs from the real vendor ranges once `aicrawl ranges` has run. Offline, it falls back to made-up ranges in `198.18.0.0/15`, and the report warns about it. Run `aicrawl ranges` before analysing real logs in the same database, so the real lists replace the made-up ones.
 
 ## Tests
 
